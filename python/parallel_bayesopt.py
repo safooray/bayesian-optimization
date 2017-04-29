@@ -8,9 +8,8 @@ import sklearn.gaussian_process as gp
 
 from scipy.stats import norm
 from scipy.optimize import minimize
-Q = 2
 
-def multi_point_expected_improvement(x, gaussian_process, evaluated_loss, greater_is_better=False, n_params=1):
+def expected_improvement(x, gaussian_process, evaluated_loss, greater_is_better=False, n_params=1, q=1, n_samples=1, force_estimate=False):
     """ expected_improvement
 
     Expected improvement acquisition function.
@@ -18,11 +17,11 @@ def multi_point_expected_improvement(x, gaussian_process, evaluated_loss, greate
     Arguments:
     ----------
         x: array-like, shape = [n_samples, n_hyperparams]
-            The set of points for which the expected improvement needs to be jointly computed.
+            The point for which the expected improvement needs to be computed.
         gaussian_process: GaussianProcessRegressor object.
             Gaussian process trained on previously evaluated hyperparameters.
         evaluated_loss: Numpy array.
-            Numpy array that contains the values of the loss function for the previously
+            Numpy array that contains the values off the loss function for the previously
             evaluated hyperparameters.
         greater_is_better: Boolean.
             Boolean flag that indicates whether the loss function is to be maximised or minimised.
@@ -30,31 +29,42 @@ def multi_point_expected_improvement(x, gaussian_process, evaluated_loss, greate
             Dimension of the hyperparameter space.
 
     """
+    if q == 1 and not force_estimate:
+        x_to_predict = x.reshape(-1, n_params)
 
-    x_to_predict = x.reshape(-1, n_params)
-    mu, sigma = gaussian_process.predict(x_to_predict, return_std=True)
-    print mu.shape, sigma.shape
+        mu, sigma = gaussian_process.predict(x_to_predict, return_std=True)
 
-    if greater_is_better:
-        loss_optimum = np.max(evaluated_loss)
+        if greater_is_better:
+            loss_optimum = np.max(evaluated_loss)
+        else:
+            loss_optimum = np.min(evaluated_loss)
+
+        scaling_factor = (-1) ** (not greater_is_better)
+        mu = mu.ravel()
+        sigma = sigma.ravel()
+        # In case sigma equals zero
+        with np.errstate(divide='ignore'):
+            Z = scaling_factor * (mu - loss_optimum) / sigma
+            expected_improvement = scaling_factor * (mu - loss_optimum) * norm.cdf(Z) + sigma * norm.pdf(Z)
+            expected_improvement[sigma == 0.0] == 0.0
     else:
-        loss_optimum = np.min(evaluated_loss)
+        x_to_predict = x.reshape(-1, q, n_params)
+        n_sets = x_to_predict.shape[0]
+        expected_improvement = np.zeros((n_sets,))
+        for i in range(n_sets):
+            mu, cov = gaussian_process.predict(x_to_predict[i], return_cov=True)
+            L = np.linalg.cholesky(cov)
+            Z = np.random.randn(q, n_samples)
+            f = mu.reshape(q,1) + np.dot(L, Z)
+                
+            if greater_is_better:
+                expected_improvement[i] = np.mean(np.maximum(+np.max(f, axis=0) - np.max(evaluated_loss), 0))
+            else:
+                expected_improvement[i] = np.mean(np.maximum(-np.min(f, axis=0) + np.min(evaluated_loss), 0))
+    return -1 * expected_improvement
+       
 
-    scaling_factor = (-1) ** (not greater_is_better)
-
-    # In case sigma equals zero
-    L = np.linalg.cholesky(sigma)
-    print L.shape
-    with np.errstate(divide='ignore'):
-        
-        #TODO sample f multiple times
-        Z = np.random.randn(Q)
-        f = m + L*Z
-        print f.shape
-        q_expected_improvement = scaling_factor * (min(f) - loss_optimum)
-    return -1 * q_expected_improvement
-
-def sample_next_hyperparameter_set(acquisition_func, gaussian_process, evaluated_loss, greater_is_better=False,
+def sample_next_hyperparameter(acquisition_func, gaussian_process, evaluated_loss, greater_is_better=False,
                                bounds=(0, 10), n_restarts=25):
     """ sample_next_hyperparameter
 
@@ -81,7 +91,7 @@ def sample_next_hyperparameter_set(acquisition_func, gaussian_process, evaluated
     best_acquisition_value = 1
     n_params = bounds.shape[0]
 
-    starting_point = np.random.uniform(bounds[:, 0], bounds[:, 1], size=(Q, n_params)):
+    for starting_point in np.random.uniform(bounds[:, 0], bounds[:, 1], size=(n_restarts, n_params)):
 
         res = minimize(fun=acquisition_func,
                        x0=starting_point.reshape(1, -1),
@@ -97,7 +107,7 @@ def sample_next_hyperparameter_set(acquisition_func, gaussian_process, evaluated
 
 
 def optimize(n_iters, sample_loss, bounds, x0=None, n_pre_samples=5,
-                          gp_params=None, alpha=1e-5, epsilon=1e-7):
+                          gp_params=None, random_search=False, alpha=1e-5, epsilon=1e-7, ei_q = 1, ei_nsamples = 100, ei_force_estimate = False):
     """ bayesian_optimisation
 
     Uses Gaussian Processes to optimise the loss function `sample_loss`.
@@ -117,6 +127,9 @@ def optimize(n_iters, sample_loss, bounds, x0=None, n_pre_samples=5,
             If x0 is None, samples `n_pre_samples` initial points from the loss function.
         gp_params: dictionary.
             Dictionary of parameters to pass on to the underlying Gaussian Process.
+        random_search: integer.
+            Flag that indicates whether to perform random search or L-BFGS-B optimisation
+            over the acquisition function.
         alpha: double.
             Variance of the error term of the GP.
         epsilon: double.
@@ -151,29 +164,36 @@ def optimize(n_iters, sample_loss, bounds, x0=None, n_pre_samples=5,
                                             normalize_y=True)
 
     for n in range(n_iters):
-
         model.fit(xp, yp)
-
         # Sample next hyperparameter
-        next_samples = sample_next_hyperparameter_set(multi_point_expected_improvement, model, yp, greater_is_better=True, bounds=bounds, n_restarts=100)
+        if random_search:
+            x_random = np.random.uniform(bounds[:, 0], bounds[:, 1], size=(random_search, ei_q, n_params))
+            ei = -1 * expected_improvement(x_random, model, yp, greater_is_better=True, n_params=n_params, q = ei_q, n_samples=ei_nsamples, force_estimate = ei_force_estimate)
+            next_samples = x_random[np.argmax(ei), ...]
+        else:
+            next_samples = sample_next_hyperparameter(expected_improvement, model, yp, greater_is_better=True, bounds=bounds, n_restarts=100)
 
         # Duplicates will break the GP. In case of a duplicate, we will randomly sample a next query point.
-        if np.any(np.abs(next_sample - xp) <= epsilon):
-            next_samples = np.random.uniform(bounds[:, 0], bounds[:, 1], size=(Q, n_params))
+        for i in range(ei_q):
+            if np.any(np.abs(next_samples[i] - xp) <= epsilon):
+                next_samples[i] = np.random.uniform(bounds[:, 0], bounds[:, 1], bounds.shape[0])
 
         # Sample loss for new set of parameters
-        #TODO assing to multiple threads
-        for s in range (Q):
-            x = next_samples[s,...]
-            y = sample_loss(x)
-            # Update lists
-            x_list.append(x)
-            y_list.append(y)
-            # Update xp and yp
-            xp = np.array(x_list)
-            yp = np.array(y_list)
-            best = np.argmin(yp);
-            print 'Bayesopt Iteration {0} out of {1}...'.format(n, n_iters)
-            print 'Evaluation point: ',['{0:0.2f}'.format(i) for i in x],' Result: {0:0.2f}'.format(y) 
-            print 'Optimum thus far: ',['{0:0.2f}'.format(i) for i in xp[best]],' Result: {0:0.2f}'.format(yp[best]) 
+        cv_scores = np.zeros(ei_q)
+        for i in range(ei_q):
+            cv_scores[i] = sample_loss(next_samples[i])
+        # Update lists
+        x_list.extend(next_samples)
+        y_list.extend(cv_scores)
+
+        # Update xp and yp
+        xp = np.array(x_list)
+        yp = np.array(y_list)
+        best = np.argmax(yp);
+        print 'Bayesopt Iteration {0} out of {1}...'.format(n, n_iters)
+        for i in range(ei_q):
+            print 'Evaluation point {0}: '.format(i), ['{0:0.2f}'.format(e) for e in next_samples[i]],' Result: {0:0.2f}'.format(cv_scores[i]) 
+        print 'Optimum thus far: ',['{0:0.2f}'.format(i) for i in xp[best]],' Result: {0:0.2f}'.format(yp[best]) 
+
+
     return xp, yp
